@@ -17,7 +17,13 @@
 #include <utils/logger.h>
 #include <wups/storage.h>
 
+#include <algorithm>
+#include <sys/stat.h>
+#include <vector>
+
 #define TEXT_SEL(x, text1, text2) ((x) ? (text1) : (text2))
+
+bool ConfirmModpackFiles(const std::string &basePath, const std::string &modpackName);
 
 uint8_t *screenBuffer_0 = nullptr;
 uint8_t *screenBuffer_1 = nullptr;
@@ -131,7 +137,18 @@ void HandleMultiModPacks(uint64_t titleID) {
         }
         return;
     } else if (modTitlePath.size() == 1 && gAutoApplySingleModpack && gSkipPrepareIfSingleModpack) {
-        ReplaceContent(modTitlePath.begin()->second, modTitlePath.begin()->first);
+        // Skip the "Preparing" countdown, but still show the file list + confirmation.
+        KPADInit();
+        WPADEnableURCC(true);
+        if (!ScreenInit()) {
+            KPADShutdown();
+            return;
+        }
+        if (ConfirmModpackFiles(modTitlePath.begin()->second, modTitlePath.begin()->first)) {
+            ReplaceContent(modTitlePath.begin()->second, modTitlePath.begin()->first);
+        }
+        ScreenDeInit();
+        KPADShutdown();
         return;
     }
 
@@ -206,7 +223,9 @@ void HandleMultiModPacks(uint64_t titleID) {
             }
 
             if (frameCounter >= durationInFrames) {
-                ReplaceContent(modTitlePath.begin()->second, modTitlePath.begin()->first);
+                if (ConfirmModpackFiles(modTitlePath.begin()->second, modTitlePath.begin()->first)) {
+                    ReplaceContent(modTitlePath.begin()->second, modTitlePath.begin()->first);
+                }
                 break;
             }
 
@@ -281,7 +300,9 @@ void HandleMultiModPacks(uint64_t titleID) {
                     std::string value = it.second;
 
                     if (wantToExit && cur_ == selected) {
-                        ReplaceContent(value, key);
+                        if (ConfirmModpackFiles(value, key)) {
+                            ReplaceContent(value, key);
+                        }
                         break;
                     }
 
@@ -401,6 +422,248 @@ bool ReplaceContentInternal(const std::string &basePath, const std::string &subd
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// File list + "Is this correct?" confirmation screen
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr size_t MAX_LISTED_FILES = 10000; // safety cap for huge modpacks
+constexpr int LIST_TOP            = 4;     // first screen row of the file list
+constexpr int LIST_ROWS           = 11;    // rows 4..14
+constexpr int MAX_PATH_CHARS      = 74;
+
+struct ModFileEntry {
+    std::string volPath; // e.g. /vol/content/movie/intro.mp4
+    bool hidden;         // true for .deleted_ markers
+};
+
+struct HeldState {
+    uint32_t vpad    = 0;
+    uint32_t kpad[4] = {0, 0, 0, 0};
+};
+
+void CollectModFiles(const std::string &dirPath, const std::string &volPath, std::vector<ModFileEntry> &out, size_t &notListed, int depth) {
+    if (depth > 32) {
+        return;
+    }
+    DIR *dir = opendir(dirPath.c_str());
+    if (!dir) {
+        return;
+    }
+    std::vector<std::string> subDirs;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        // Don't trust d_type on the Wii U SD devoptab: ask the file system directly.
+        bool isDir = false;
+        struct stat st {};
+        std::string fullPath = dirPath + "/" + name;
+        if (stat(fullPath.c_str(), &st) == 0) {
+            isDir = S_ISDIR(st.st_mode);
+        } else {
+            isDir = (entry->d_type == DT_DIR);
+        }
+        if (isDir) {
+            subDirs.emplace_back(name);
+            continue;
+        }
+        if (out.size() >= MAX_LISTED_FILES) {
+            notListed++;
+            continue;
+        }
+        if (strncmp(name, ".deleted_", 9) == 0 && name[9] != '\0') {
+            out.push_back({volPath + "/" + (name + 9), true});
+        } else {
+            out.push_back({volPath + "/" + name, false});
+        }
+    }
+    closedir(dir);
+
+    for (const auto &sub : subDirs) {
+        CollectModFiles(dirPath + "/" + sub, volPath + "/" + sub, out, notListed, depth + 1);
+    }
+}
+
+// Keeps the end of long paths (the file name) visible.
+std::string FitPath(const std::string &path, size_t maxLen) {
+    if (path.size() <= maxLen) {
+        return path;
+    }
+    return "..." + path.substr(path.size() - (maxLen - 3));
+}
+
+// Returns the buttons currently held on GamePad, Wii Remote, Classic and Pro controllers.
+// If a controller has no new sample, its last known state is kept, so no fake presses happen.
+uint32_t ReadHeldButtons(HeldState &state) {
+    VPADStatus vpad_data{};
+    VPADReadError vpad_error;
+    VPADRead(VPAD_CHAN_0, &vpad_data, 1, &vpad_error);
+    if (vpad_error == VPAD_READ_SUCCESS) {
+        state.vpad = vpad_data.hold;
+    } else if (vpad_error == VPAD_READ_INVALID_CONTROLLER) {
+        state.vpad = 0;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        KPADStatus kpad_data{};
+        KPADError kpad_error;
+        if (KPADReadEx((KPADChan) i, &kpad_data, 1, &kpad_error) > 0) {
+            if (kpad_error == KPAD_ERROR_OK && kpad_data.extensionType != 0xFF) {
+                if (kpad_data.extensionType == WPAD_EXT_CORE || kpad_data.extensionType == WPAD_EXT_NUNCHUK) {
+                    state.kpad[i] = remapWiiMoteButtons(kpad_data.hold);
+                } else {
+                    state.kpad[i] = remapClassicButtons(kpad_data.classic.hold);
+                }
+            } else {
+                state.kpad[i] = 0;
+            }
+        } else if (kpad_error == KPAD_ERROR_INVALID_CONTROLLER) {
+            state.kpad[i] = 0;
+        }
+    }
+
+    uint32_t held = state.vpad;
+    for (unsigned int k : state.kpad) {
+        held |= k;
+    }
+    return held;
+}
+
+void FlipScreens() {
+    OSScreenFlipBuffersEx(SCREEN_TV);
+    OSScreenFlipBuffersEx(SCREEN_DRC);
+}
+} // namespace
+
+// Screen and KPAD must already be initialized by the caller.
+// Returns true  = X pressed (start WITH the modpack)
+//         false = Y pressed (start WITHOUT mods)
+bool ConfirmModpackFiles(const std::string &basePath, const std::string &modpackName) {
+    const int x = -2;
+
+    // 1) The usual loading text while the SD card is scanned.
+    OSScreenClearBufferEx(SCREEN_TV, 0);
+    OSScreenClearBufferEx(SCREEN_DRC, 0);
+    console_print_pos(x, -1, "SDCafiine plugin " VERSION_FULL);
+    console_print_pos(x, 1, "Preparing modpack \"%s\"...", modpackName.c_str());
+    console_print_pos(x, 3, "Reading modpack files from the SD card...");
+    FlipScreens();
+
+    std::vector<ModFileEntry> files;
+    size_t notListed = 0;
+    CollectModFiles(basePath + "/content", "/vol/content", files, notListed, 0);
+    CollectModFiles(basePath + "/aoc", "/vol/aoc", files, notListed, 0);
+    std::sort(files.begin(), files.end(), [](const ModFileEntry &a, const ModFileEntry &b) { return a.volPath < b.volPath; });
+
+    size_t hiddenCount = 0;
+    for (const auto &f : files) {
+        if (f.hidden) {
+            hiddenCount++;
+        }
+    }
+    const int total  = (int) files.size();
+    const int maxTop = total > LIST_ROWS ? total - LIST_ROWS : 0;
+
+    // 2) File list + question.
+    HeldState state;
+    uint32_t prevHeld = ReadHeldButtons(state); // ignore buttons that are already held
+    int top           = 0;
+    int holdFrames    = 0;
+    bool redraw       = true;
+    bool result       = false;
+
+    while (true) {
+        uint32_t held    = ReadHeldButtons(state);
+        uint32_t pressed = held & ~prevHeld;
+        prevHeld         = held;
+
+        if (pressed & VPAD_BUTTON_X) {
+            result = true;
+            break;
+        }
+        if (pressed & VPAD_BUTTON_Y) {
+            result = false;
+            break;
+        }
+
+        int move = 0;
+        if (pressed & VPAD_BUTTON_DOWN) {
+            move = 1;
+        } else if (pressed & VPAD_BUTTON_UP) {
+            move = -1;
+        } else if (pressed & VPAD_BUTTON_R) {
+            move = LIST_ROWS;
+        } else if (pressed & VPAD_BUTTON_L) {
+            move = -LIST_ROWS;
+        }
+
+        // Hold UP/DOWN to scroll faster.
+        if (held & (VPAD_BUTTON_UP | VPAD_BUTTON_DOWN)) {
+            holdFrames++;
+            if (move == 0 && holdFrames > 25 && (holdFrames % 3) == 0) {
+                move = (held & VPAD_BUTTON_DOWN) ? 1 : -1;
+            }
+        } else {
+            holdFrames = 0;
+        }
+
+        if (move != 0) {
+            int newTop = std::clamp(top + move, 0, maxTop);
+            if (newTop != top) {
+                top    = newTop;
+                redraw = true;
+            }
+        }
+
+        if (redraw) {
+            OSScreenClearBufferEx(SCREEN_TV, 0);
+            OSScreenClearBufferEx(SCREEN_DRC, 0);
+            console_print_pos(x, -1, "SDCafiine plugin " VERSION_FULL);
+            console_print_pos(x, 1, "Preparing modpack \"%s\"...", modpackName.c_str());
+            console_print_pos(x, 2, "%d file(s) added/replaced, %d file(s) hidden%s:",
+                              total - (int) hiddenCount, (int) hiddenCount, notListed ? " (list cut off)" : "");
+
+            if (total == 0) {
+                console_print_pos(x, LIST_TOP, "  (no files found in content/ or aoc/)");
+            }
+            for (int row = 0; row < LIST_ROWS && top + row < total; row++) {
+                const auto &f = files[top + row];
+                if (f.hidden) {
+                    console_print_pos(x, LIST_TOP + row, "[hidden] %s", FitPath(f.volPath, MAX_PATH_CHARS - 9).c_str());
+                } else {
+                    console_print_pos(x, LIST_TOP + row, "  %s", FitPath(f.volPath, MAX_PATH_CHARS - 2).c_str());
+                }
+            }
+
+            if (total > LIST_ROWS) {
+                console_print_pos(x, 15, "Files %d-%d of %d   UP/DOWN scroll, L/R page",
+                                  top + 1, std::min(top + LIST_ROWS, total), total);
+            }
+            if (notListed) {
+                console_print_pos(x, 15, "Showing first %d, %d more not listed. UP/DOWN, L/R",
+                                  total, (int) notListed);
+            }
+            console_print_pos(x, 16, "Is this correct?");
+            console_print_pos(x, 17, "X = Yes (with mods)   Y = No (without mods)   [Wiimote: 2/1]");
+            FlipScreens();
+            redraw = false;
+        }
+
+        OSSleepTicks(OSMillisecondsToTicks(16));
+    }
+
+    OSScreenClearBufferEx(SCREEN_TV, 0);
+    OSScreenClearBufferEx(SCREEN_DRC, 0);
+    console_print_pos(x, -1, "SDCafiine plugin " VERSION_FULL);
+    console_print_pos(x, 1, result ? "Applying modpack \"%s\"..." : "Starting without mods...", modpackName.c_str());
+    FlipScreens();
+
+    return result;
+}
 
 void console_print_pos(int x, int y, const char *format, ...) {
     char *tmp = nullptr;
