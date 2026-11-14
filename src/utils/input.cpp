@@ -30,6 +30,13 @@ uint32_t remapWiiMoteButtons(uint32_t buttons) {
     if (buttons & WPAD_BUTTON_HOME)
         conv_buttons |= VPAD_BUTTON_HOME;
 
+    // Wii Remote has no X/Y: 2 = Yes (X), 1 = No (Y) on the confirmation screen
+    if (buttons & WPAD_BUTTON_2)
+        conv_buttons |= VPAD_BUTTON_X;
+
+    if (buttons & WPAD_BUTTON_1)
+        conv_buttons |= VPAD_BUTTON_Y;
+
     return conv_buttons;
 }
 
